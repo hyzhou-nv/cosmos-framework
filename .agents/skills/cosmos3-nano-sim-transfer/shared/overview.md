@@ -16,6 +16,7 @@ Its 600-frame source is preserved at 30 FPS.
 - [Write prompts and prepare captions](prompt-guide.md) for the target RGB.
 - [Prepare a dataset](local-dataset.md) with aligned RGB, controls and captions.
 - [Generate a video with an existing model](../inference/SKILL.md).
+- [Replace part of a real video](../real2real-replace/SKILL.md) — regenerate a masked region and hold the rest at the source's own latents.
 - [Diagnose a loading or output problem](../troubleshooting/SKILL.md).
 
 The full training workflow starts at Stage 0. Inference starts from an

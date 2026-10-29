@@ -561,7 +561,59 @@ def _generate_causal_transfer_sample(
             else torch.bfloat16
         ),
     )
-    target_norm = torch.zeros_like(control_norm)  # [C,T,H,W]
+
+    # ROI pinning replaces the zero placeholder with the reference video, so the
+    # ordinary VAE path encodes it into the generated vision item and the AR loop can
+    # hold the unmasked region at those clean latents. ``num_conditional_frames=0``
+    # keeps it out of the pack as a clean prefix; only the sampler reads it.
+    def _require_matching_fps(actual: float, label: str) -> None:
+        # Frame rates are labels here, not resampling instructions: a mismatch means
+        # the pinned pixels would be held against the wrong moment in time.
+        if not math.isclose(actual, output_fps, rel_tol=1e-4, abs_tol=1e-3):
+            raise ValueError(f"ROI pin {label} FPS {actual} does not match transfer FPS {output_fps}")
+
+    # Read through ``getattr`` like ``transfer_resize_mode`` above: callers build
+    # sample args as plain namespaces in places, and these fields are optional.
+    roi_pin_mask_path = getattr(sample_args, "roi_pin_mask_path", None)
+    roi_pin_mask: torch.Tensor | None = None
+    roi_pin_strength: float | None = None
+    if roi_pin_mask_path is not None:
+        roi_pin_strength = float(getattr(sample_args, "roi_pin_strength", 1.0))
+        reference_path = sample_args.vision_path
+        if reference_path is None:
+            raise ValueError("roi_pin_mask_path requires vision_path")
+        reference_frames, reference_fps, _, _ = read_and_resize_media(  # [3,T,H,W]
+            Path(reference_path),
+            resolution=sample_args.resolution,
+            aspect_ratio=sample_args.aspect_ratio,
+            max_frames=total_frames,
+        )
+        _require_matching_fps(reference_fps, "reference")
+        mask_frames, mask_fps, _, _ = read_and_resize_media(  # [3,T,H,W]
+            Path(roi_pin_mask_path),
+            resolution=sample_args.resolution,
+            aspect_ratio=sample_args.aspect_ratio,
+            max_frames=total_frames,
+        )
+        _require_matching_fps(mask_fps, "mask")
+        for label, frames_ in (("reference", reference_frames), ("mask", mask_frames)):
+            if frames_.shape[1] < total_frames:
+                raise ValueError(f"ROI pin {label} has {frames_.shape[1]} frames, need at least {total_frames}")
+        target_norm = uint8_to_normalized_float(  # [C,T,H,W]
+            pad_temporal_frames(reference_frames[:, :total_frames], encoded_frames),
+            dtype=control_norm.dtype,
+        )
+        # Pad the mask the way the encoder inputs are padded so its frame count lines
+        # up with the latent timeline, then binarize at the shared 16/255 threshold.
+        roi_pin_mask = (
+            pad_temporal_frames(mask_frames[:, :total_frames], encoded_frames)[0].float() > 16.0
+        ).float()  # [T,H,W]
+        log.info(
+            f"ROI pinning: generating {float(roi_pin_mask.mean()) * 100:.1f}% of pixels, "
+            f"pulling the rest toward {reference_path} at strength {roi_pin_strength}"
+        )
+    else:
+        target_norm = torch.zeros_like(control_norm)  # [C,T,H,W]
     data_batch = build_transfer_batch(
         control_videos=[control_norm],
         target_video=target_norm,
@@ -580,6 +632,9 @@ def _generate_causal_transfer_sample(
     # Internal request metadata, after edge/blur/depth/seg validation above.
     # Shared models retain their normal path on every other request.
     data_batch["_preserve_transfer_numerics"] = True
+    if roi_pin_mask is not None:
+        data_batch["_roi_pin_mask"] = roi_pin_mask  # [T,H,W]
+        data_batch["_roi_pin_strength"] = roi_pin_strength
 
     decoded_chunks: list[torch.Tensor] = []
     pending_output_chunks: list[torch.Tensor] = []

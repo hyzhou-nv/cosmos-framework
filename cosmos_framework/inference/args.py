@@ -1338,6 +1338,19 @@ class TransferDataArgs(ArgsBase, _TransferDataBase):
     seg: TransferArgs | None = None
     wsm: TransferArgs | None = None
     lidar: LidarTransferArgs | None = None
+    roi_pin_mask_path: ResolvedFilePathOrUrl | None = None
+    """Grayscale mask video: white regions are generated, black regions are pinned to ``vision_path``."""
+    roi_pin_strength: float = pydantic.Field(default=1.0, ge=0.0, le=1.0)
+    """How hard the pinned region is pulled toward the reference; 0 disables, 1 pins exactly."""
+
+    @pydantic.field_validator("roi_pin_strength", mode="before")
+    @classmethod
+    def _coerce_none_roi_pin_strength(cls, v: float | None) -> float:
+        # The override defaults to None ("unset") and `_build` does not strip it,
+        # so an unset strength resolves here to the full pull, matching the
+        # `TransferArgs.weight` convention.
+        return 1.0 if v is None else v
+
     negative_prompt_file: str | None = None
     """JSON negative caption file for transfer specs (absolute path or filename under ``defaults/``)."""
     num_video_frames_per_chunk: pydantic.PositiveInt | None = None
@@ -1379,6 +1392,17 @@ class TransferDataOverrides(OverridesBase, _TransferDataBase):
     unset. Joint camera+LiDAR: pair it with ``wsm: {}`` and one or more multiview views, each
     carrying its own ``control_path``. ``lidar.condition_path`` and ``lidar.num_conditional_sweeps``
     supply measured target sweeps as a clean conditioning prefix."""
+    roi_pin_mask_path: ResolvedFilePathOrUrl | None = None
+    """Grayscale mask video for ROI pinning: white (>16/255) regions are generated from the
+    control hint, black regions are held at ``vision_path``'s clean latents throughout sampling.
+    The pinned region is held at ``vision_path``, which is not a control hint, so the
+    surroundings guide generation without occupying a control channel. Causal
+    (autoregressive) transfer only."""
+    roi_pin_strength: float | None = pydantic.Field(default=None, ge=0.0, le=1.0)
+    """Strength of the pull toward the reference in the pinned region. The pull is applied to
+    the predicted velocity, not by overwriting latents, so the pinned region is re-noised to
+    each step's sigma like everything else. 1 makes that step's x0 prediction equal the
+    reference exactly; lower values let the model deviate."""
     negative_prompt_file: str | None = None
     """JSON negative caption file for transfer specs (absolute path or filename under ``defaults/``)."""
     num_video_frames_per_chunk: pydantic.PositiveInt | None = None
@@ -1419,7 +1443,12 @@ class TransferDataOverrides(OverridesBase, _TransferDataBase):
         # default value must round-trip without a hint. Only an *explicit*
         # non-default ``control_guidance`` signals an intended-but-incomplete
         # transfer config, so it is checked separately below.
-        exempt = hint_field_names | {"control_guidance"}
+        # ``roi_pin_strength`` is concretized to its no-op default (1.0) on the Args
+        # side for every sample, so an Args -> Overrides round-trip carries it even
+        # for non-transfer samples; exempt it for the same reason as
+        # ``control_guidance``. ``roi_pin_mask_path`` is the field that actually
+        # signals ROI pinning, and it stays in the list.
+        exempt = hint_field_names | {"control_guidance", "roi_pin_strength"}
         transfer_only = [
             name
             for name in TransferDataOverrides.__annotations__

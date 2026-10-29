@@ -485,6 +485,48 @@ def _validate_teacher_forcing_kv_strategy(
         )
 
 
+def build_latent_roi_pin_mask(
+    roi_pixel_mask: torch.Tensor,  # [T_pix,H_pix,W_pix], 1 = generate
+    *,
+    target_latent: torch.Tensor,  # [1,C,T,H,W]
+    temporal_compression_factor: int,
+) -> torch.Tensor:  # [1,C,T,H,W], 1 = pull toward the reference
+    """Reduce a pixel-space ROI to the latent grid and return its complement.
+
+    The ROI (the region to generate) is reduced with maxima -- the first latent
+    frame covers one pixel frame and each later one covers
+    ``temporal_compression_factor`` -- so a small or short-lived region claims its
+    whole latent cell instead of being averaged out of existence. The pin mask is
+    the complement taken *after* that reduction, so it is the pinned side that
+    shrinks and the generated side that grows.
+
+    This module binds ``log`` to the bare loguru logger, whose handlers the
+    framework's logging setup removes; anything written through it is discarded.
+    Report through the configured logger so the caller can actually see that
+    pinning engaged.
+    """
+    from cosmos_framework.utils import log as configured_log
+
+    if roi_pixel_mask.ndim != 3:
+        raise ValueError(f"roi_pixel_mask must be [T,H,W], got {tuple(roi_pixel_mask.shape)}")
+    _, channels, lat_t, lat_h, lat_w = target_latent.shape
+    roi = roi_pixel_mask.to(device=target_latent.device, dtype=torch.float32)  # [T_pix,H_pix,W_pix]
+    tcf = max(int(temporal_compression_factor), 1)
+    groups = [roi[0:1]] + [roi[i : i + tcf] for i in range(1, roi.shape[0], tcf)]
+    if len(groups) != lat_t:
+        raise ValueError(
+            f"roi_pixel_mask has {roi.shape[0]} frames -> {len(groups)} latent frames, "
+            f"but the target latent has {lat_t}"
+        )
+    roi_t = torch.stack([g.amax(dim=0) for g in groups])  # [T_lat,H_pix,W_pix]
+    roi_lat = torch.nn.functional.adaptive_max_pool2d(roi_t.unsqueeze(1), (lat_h, lat_w)).squeeze(1)
+    configured_log.info(
+        f"[ROI pin] generating {float(roi_lat.mean()) * 100:.1f}% of latent cells "
+        f"({float(roi.mean()) * 100:.1f}% of pixels); the rest is pulled toward the reference"
+    )
+    return (1.0 - roi_lat)[None, None].expand(1, channels, lat_t, lat_h, lat_w).contiguous()
+
+
 class OmniMoTCausalModel(OmniMoTModel):
     """Mixture of Transformers model with causal (AR) generation capabilities.
 
@@ -2549,6 +2591,25 @@ class OmniMoTCausalModel(OmniMoTModel):
 
             report_history(start_frame)
 
+            # Optional ROI pinning: the region outside the request's mask is pulled
+            # toward the reference the request supplied (transfer inference encodes it
+            # into the generated vision item in place of its zero placeholder), so only
+            # the masked region is really generated. The reference is clean latents,
+            # not a control hint, so the model sees real surroundings while generating.
+            latent_pin_mask: torch.Tensor | None = None
+            pin_strength = float(data_batch.get("_roi_pin_strength", 1.0))
+            roi_pixel_mask = data_batch.get("_roi_pin_mask")  # [T_pix,H_pix,W_pix] or None
+            if roi_pixel_mask is not None:
+                if not is_transfer:
+                    raise ValueError("_roi_pin_mask is supported for transfer AR inference only")
+                if sampler_mode != "distilled":
+                    raise ValueError("ROI pinning requires the distilled AR sampler")
+                latent_pin_mask = build_latent_roi_pin_mask(
+                    roi_pixel_mask,
+                    target_latent=vision_items[generation_vision_item_idx],
+                    temporal_compression_factor=int(self.tokenizer_vision_gen.temporal_compression_factor or 1),
+                )  # [1,C,T,H,W]
+
             # Step 8: AR Generation Loop (chunkwise; chunk_size == 1 is framewise).
             # Chunks follow the training partition [1, C, C, ...] in absolute latent-
             # frame index: frame 0 is its own singleton chunk, then C-frame chunks.
@@ -2779,6 +2840,19 @@ class OmniMoTCausalModel(OmniMoTModel):
                     preserve_transfer_numerics=preserve_transfer_numerics,
                     transfer_history_sink_tokens=transfer_history_sink_tokens,
                     transfer_history_max_tokens=transfer_history_target_max_tokens,
+                    pin_reference=(
+                        None
+                        if latent_pin_mask is None
+                        else vision_items[generation_vision_item_idx][:, :, chunk_start:chunk_end].to(
+                            **self.tensor_kwargs
+                        )
+                    ),
+                    pin_mask=(
+                        None
+                        if latent_pin_mask is None
+                        else latent_pin_mask[:, :, chunk_start:chunk_end].to(**self.tensor_kwargs)
+                    ),
+                    pin_strength=pin_strength,
                 )
                 if on_clean_vision_chunk is not None:
                     on_clean_vision_chunk(denoised_chunk)
@@ -3344,8 +3418,29 @@ class OmniMoTCausalModel(OmniMoTModel):
         num_frames: int | None = None,
         distilled_num_steps: int | None = None,
         schedule_frame_idx: int | None = None,
+        pin_reference: torch.Tensor | None = None,  # [B,N_tokens_flat]
+        pin_mask: torch.Tensor | None = None,  # [B,N_tokens_flat]
+        pin_strength: float = 1.0,
     ) -> torch.Tensor:  # [B,N_tokens_flat]
-        """Sample one AR unit, optionally separating its schedule and noise indices."""
+        """Sample one AR unit, optionally separating its schedule and noise indices.
+
+        ``pin_reference``/``pin_mask`` hold part of the unit near a clean reference.
+        The pull is applied to the predicted velocity rather than by overwriting the
+        latent: with ``x0_pred = x - sigma * v``, the velocity that lands the pinned
+        region exactly on the reference is ``(x - reference) / sigma``, so
+
+            v <- v + mask * strength * ((x - reference) / sigma - v)
+
+        At ``strength == 1`` that step's x0 prediction equals the reference there,
+        and the sampler then re-noises it to ``sigma_next`` along with everything
+        else -- unlike overwriting the latent with the *clean* reference, which
+        would leave the pinned region at noise level 0 inside a latent the model
+        expects at level ``sigma``. Lower strengths let the model deviate.
+        """
+        if (pin_reference is None) != (pin_mask is None):
+            raise ValueError("pin_reference and pin_mask must be both set or both None")
+        if not 0.0 <= pin_strength <= 1.0:
+            raise ValueError(f"pin_strength must be in [0, 1], got {pin_strength}")
         full_t_list = self._get_ar_distilled_timestep_schedule(
             distilled_num_steps,
             frame_idx=frame_idx if schedule_frame_idx is None else schedule_frame_idx,
@@ -3358,6 +3453,14 @@ class OmniMoTCausalModel(OmniMoTModel):
             raise ValueError(f"Unsupported distilled sample_type: {sample_type!r}")
         max_timestep = float(self.config.rectified_flow_inference_config.num_train_timesteps)
         x = initial_noise.float()  # [B,N_tokens_flat]
+        if pin_reference is not None:
+            pin_reference = pin_reference.to(dtype=x.dtype, device=x.device)  # [B,N_tokens_flat]
+            pin_mask = pin_mask.to(dtype=x.dtype, device=x.device)  # [B,N_tokens_flat]
+            if pin_reference.shape != x.shape or pin_mask.shape != x.shape:
+                raise ValueError(
+                    f"pin_reference {tuple(pin_reference.shape)} and pin_mask {tuple(pin_mask.shape)} "
+                    f"must match the latent {tuple(x.shape)}"
+                )
         # One asynchronous copy of the schedule instead of a synchronising host->device scalar per
         # step (same float32 rounding of the same Python values; the deltas are formed in double
         # precision exactly as the previous per-step ``torch.as_tensor(sigma_next - sigma_cur)``).
@@ -3375,6 +3478,14 @@ class OmniMoTCausalModel(OmniMoTModel):
             )  # [B,1]
             velocity = velocity_fn(x, timestep).float()  # [B,N_tokens_flat]
             sigma_cur_tensor = sigmas[step_idx]  # []
+            if pin_reference is not None:
+                # ``v_to_reference`` is only well conditioned away from sigma 0; the
+                # distilled schedule never evaluates a step there, so guard rather
+                # than special-case.
+                if sigma_cur < 1e-3:
+                    raise ValueError(f"ROI pinning needs sigma > 1e-3, got {sigma_cur}")
+                v_to_reference = (x - pin_reference) / sigma_cur_tensor  # [B,N_tokens_flat]
+                velocity = velocity + pin_mask * pin_strength * (v_to_reference - velocity)
             x0_pred = x - sigma_cur_tensor * velocity  # [B,N_tokens_flat]
             if sigma_next == 0.0:
                 x = x0_pred  # [B,N_tokens_flat]
@@ -3505,6 +3616,9 @@ class OmniMoTCausalModel(OmniMoTModel):
         num_frames: int | None,
         distilled_num_steps: int | None,
         schedule_frame_idx: int | None = None,
+        pin_reference: torch.Tensor | None = None,  # [B,N_tokens_flat]
+        pin_mask: torch.Tensor | None = None,  # [B,N_tokens_flat]
+        pin_strength: float = 1.0,
     ) -> torch.Tensor:  # [B,N_tokens_flat]
         """Run the configured AR sampler for one frame or synchronized chunk."""
         if sampler_mode == "distilled":
@@ -3516,7 +3630,12 @@ class OmniMoTCausalModel(OmniMoTModel):
                 num_frames=num_frames,
                 distilled_num_steps=distilled_num_steps,
                 schedule_frame_idx=schedule_frame_idx,
+                pin_reference=pin_reference,
+                pin_mask=pin_mask,
+                pin_strength=pin_strength,
             )  # [B,N_tokens_flat]
+        if pin_reference is not None:
+            raise ValueError("ROI pinning is implemented for the distilled AR sampler only")
         if isinstance(seed, list):
             raise ValueError("Batched AR currently supports only the distilled sampler")
         if sampler_mode == "rf" and self.config.rectified_flow_inference_config.scheduler_type == "unipc":
@@ -3574,6 +3693,9 @@ class OmniMoTCausalModel(OmniMoTModel):
         transfer_history_sink_tokens: int = 0,
         transfer_history_max_tokens: int | None = None,
         batched_ar: bool = False,
+        pin_reference: torch.Tensor | None = None,  # [B,C,T,H,W]
+        pin_mask: torch.Tensor | None = None,  # [B,C,T,H,W]
+        pin_strength: float = 1.0,
     ) -> torch.Tensor:
         """
         Denoise a single frame using AR generation with cumulative pack.
@@ -3769,6 +3891,14 @@ class OmniMoTCausalModel(OmniMoTModel):
         # Initialize noise
         initial_noise = curr_vision_latent.flatten(start_dim=1)  # [B,N_tokens_flat]
 
+        # The pin tensors arrive in frame shape so callers slice them exactly like the
+        # target latent; flatten them the way the noise is flattened.
+        for name, tensor in (("pin_reference", pin_reference), ("pin_mask", pin_mask)):
+            if tensor is not None and tensor.shape != curr_vision_latent.shape:
+                raise ValueError(
+                    f"{name} {tuple(tensor.shape)} must match curr_vision_latent {tuple(curr_vision_latent.shape)}"
+                )
+
         denoised_flat = OmniMoTCausalModel._run_ar_sampler(
             self,
             velocity_fn,
@@ -3780,6 +3910,9 @@ class OmniMoTCausalModel(OmniMoTModel):
             sample_idx=frame_idx,
             num_frames=num_frames,
             distilled_num_steps=distilled_num_steps,
+            pin_reference=None if pin_reference is None else pin_reference.flatten(start_dim=1),
+            pin_mask=None if pin_mask is None else pin_mask.flatten(start_dim=1),
+            pin_strength=pin_strength,
         )  # [B,N_tokens_flat]
 
         # Reshape to frame shape
